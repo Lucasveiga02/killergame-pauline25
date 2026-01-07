@@ -10,8 +10,15 @@ import unicodedata
 
 app = Flask(__name__)
 
-# Autorise ton GitHub Pages
-CORS(app, origins=["https://lucasveiga02.github.io"])
+# CORS: autoriser GitHub Pages + dev local, et couvrir OPTIONS (preflight)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": [
+        "https://lucasveiga02.github.io",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]}},
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -20,18 +27,20 @@ PLAYERS_FILE = DATA_DIR / "players.json"
 ASSIGNMENTS_FILE = DATA_DIR / "assignments.json"
 STATE_FILE = DATA_DIR / "state.json"
 
+ADMIN_PASSWORD = "Veiga"  # tu peux le passer en variable d'env plus tard
+
 
 # -------------------------------------------------------------------
 # UTILS
 # -------------------------------------------------------------------
 
 def normalize(text: str) -> str:
-    """Normalise une chaîne pour comparaison fiable (accents / casse)."""
+    """Normalise une chaîne pour comparaison fiable (accents / casse / espaces)."""
     if not text:
         return ""
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
-    return text.lower().strip()
+    return " ".join(text.lower().strip().split())
 
 
 def load_json(path: Path, default):
@@ -50,13 +59,54 @@ def save_json(path: Path, data):
 def ensure_player_state(state: dict, player_id: str) -> dict:
     """Crée l'entrée state pour un joueur si absente. ID = nom."""
     if player_id not in state:
-        state[player_id] = {
-            "mission_done": False,
-            "guess": None,
-            "points": 0,
-            "discovered_by_target": False
-        }
+        state[player_id] = default_player_state()
     return state[player_id]
+
+
+def default_player_state() -> dict:
+    """Valeurs par défaut pour un joueur."""
+    return {
+        "mission_done": False,
+        "guess": None,                 # {killer_id, killer_display, mission} ou None
+        "points": 0,
+        "discovered_by_target": False
+    }
+
+
+def build_default_state(players: list) -> dict:
+    """Construit un state complet avec tous les joueurs aux valeurs par défaut."""
+    state = {}
+    for p in players:
+        pid = p.get("id")
+        if pid:
+            state[pid] = default_player_state()
+    return state
+
+
+def load_assignments():
+    """
+    Supporte 2 formats :
+    1) Nouveau (recommandé) : dict
+       { "Maxence": {"target": "...", "mission": "..."}, ... }
+    2) Ancien : list
+       [{"killer":"...", "target":"...", "mission":"..."}, ...]
+    """
+    raw = load_json(ASSIGNMENTS_FILE, {})
+    if isinstance(raw, dict):
+        return raw, "dict"
+    if isinstance(raw, list):
+        return raw, "list"
+    return {}, "unknown"
+
+
+def find_killer_key(assignments_dict: dict, player_display: str):
+    """Trouve la clé killer dans assignments_dict via normalisation."""
+    wanted = normalize(player_display)
+    # match exact normalisé
+    for k in assignments_dict.keys():
+        if normalize(k) == wanted:
+            return k
+    return None
 
 
 # -------------------------------------------------------------------
@@ -87,31 +137,52 @@ def get_players():
 @app.get("/api/mission")
 def get_mission():
     player_display = request.args.get("player")
-
     if not player_display:
         return jsonify(ok=False, error="Missing player parameter"), 400
 
-    assignments = load_json(ASSIGNMENTS_FILE, [])
+    players = load_json(PLAYERS_FILE, [])
     state = load_json(STATE_FILE, {})
 
-    norm_input = normalize(player_display)
+    assignments, fmt = load_assignments()
 
-    for a in assignments:
-        if normalize(a.get("killer", "")) == norm_input:
-            killer_name = a["killer"]
+    # --- Nouveau format dict ---
+    if fmt == "dict":
+        killer_key = find_killer_key(assignments, player_display)
+        if not killer_key:
+            return jsonify(ok=False, error="Player not found in assignments"), 404
 
-            player_state = ensure_player_state(state, killer_name)
-            save_json(STATE_FILE, state)
+        a = assignments.get(killer_key, {}) or {}
+        player_state = ensure_player_state(state, killer_key)
+        save_json(STATE_FILE, state)
 
-            return jsonify(
-                ok=True,
-                player={"id": killer_name, "display": killer_name},
-                mission={"text": a.get("mission", "—")},
-                target={"display": a.get("target", "—")},
-                mission_done=bool(player_state.get("mission_done", False))
-            )
+        return jsonify(
+            ok=True,
+            player={"id": killer_key, "display": killer_key},
+            mission={"text": a.get("mission", "—")},
+            target={"display": a.get("target", "—")},
+            mission_done=bool(player_state.get("mission_done", False))
+        )
 
-    return jsonify(ok=False, error="Player not found"), 404
+    # --- Ancien format list (fallback) ---
+    if fmt == "list":
+        norm_input = normalize(player_display)
+        for a in assignments:
+            if normalize(a.get("killer", "")) == norm_input:
+                killer_name = a["killer"]
+                player_state = ensure_player_state(state, killer_name)
+                save_json(STATE_FILE, state)
+
+                return jsonify(
+                    ok=True,
+                    player={"id": killer_name, "display": killer_name},
+                    mission={"text": a.get("mission", "—")},
+                    target={"display": a.get("target", "—")},
+                    mission_done=bool(player_state.get("mission_done", False))
+                )
+
+        return jsonify(ok=False, error="Player not found in assignments"), 404
+
+    return jsonify(ok=False, error="Invalid assignments format"), 500
 
 
 # -------------------------------------------------------------------
@@ -122,15 +193,14 @@ def get_mission():
 
 @app.post("/api/mission_done")
 def mission_done():
-    data = request.get_json() or {}
-    player_id = data.get("player_id") or data.get("player_display")
+    data = request.get_json(silent=True) or {}
+    player_id = (data.get("player_id") or data.get("player_display") or "").strip()
 
     if not player_id:
         return jsonify(ok=False, error="Missing player_id"), 400
 
     state = load_json(STATE_FILE, {})
     entry = ensure_player_state(state, player_id)
-
     entry["mission_done"] = True
     save_json(STATE_FILE, state)
 
@@ -149,11 +219,11 @@ def mission_done():
 
 @app.post("/api/guess")
 def submit_guess():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
 
-    player_id = data.get("player_id") or data.get("player_display")
-    accused_id = data.get("accused_killer_id") or data.get("accused_killer_display")
-    guessed_mission = data.get("guessed_mission")
+    player_id = (data.get("player_id") or data.get("player_display") or "").strip()
+    accused_id = (data.get("accused_killer_id") or data.get("accused_killer_display") or "").strip()
+    guessed_mission = (data.get("guessed_mission") or "").strip()
 
     if not player_id:
         return jsonify(ok=False, error="Missing player_id"), 400
@@ -205,6 +275,29 @@ def leaderboard():
         })
 
     return jsonify(rows)
+
+
+# -------------------------------------------------------------------
+# POST /api/admin/reset
+# body: { password: "Veiga" }
+# -> remet STATE_FILE aux valeurs par défaut (sans effacer les joueurs)
+# -------------------------------------------------------------------
+
+@app.post("/api/admin/reset")
+def admin_reset():
+    data = request.get_json(silent=True) or {}
+    password = (data.get("password") or "").strip()
+
+    if password != ADMIN_PASSWORD:
+        return jsonify(ok=False, error="Bad password"), 403
+
+    players = load_json(PLAYERS_FILE, [])
+
+    # Reconstruit un state complet (tous joueurs présents) aux valeurs par défaut
+    new_state = build_default_state(players)
+    save_json(STATE_FILE, new_state)
+
+    return jsonify(ok=True, reset=True, players=len(new_state))
 
 
 # -------------------------------------------------------------------
