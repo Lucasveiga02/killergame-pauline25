@@ -4,7 +4,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 
 CORS(app, origins=[
-    "https://<username>.github.io",   # autorise GitHub Pages
+    "https://lucasveiga02.github.io/killergame-frontend/",   # autorise GitHub Pages
 ])
 
 @app.get("/")
